@@ -1,0 +1,201 @@
+import requests
+import json
+import os
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from threading import Thread
+import time
+
+app = Flask(__name__)
+CORS(app)
+
+# ==================== [ ⚠️ API KEYS CONFIGURATION ] ====================
+TELEGRAM_BOT_TOKEN = "8142082008:AAFdWGm7K4Ql7l-ytZON6-FjMtoLAGQlgT4"   
+TELEGRAM_CHAT_ID = "7345558963"       
+IMGBB_API_KEY = "371d33f4a13209017e739a26fdb50c89"             
+# =====================================================================
+
+DB_FILE = "products.json"
+
+# Database Init
+if not os.path.exists(DB_FILE):
+    with open(DB_FILE, "w") as f:
+        json.dump([], f)
+
+def load_products():
+    with open(DB_FILE, "r") as f:
+        return json.load(f)
+
+def save_products(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f, indent=4)
+
+def upload_to_imgbb(file_bytes, filename):
+    try:
+        url = "https://api.imgbb.com/1/upload"
+        payload = {"key": IMGBB_API_KEY}
+        files = {"image": (filename, file_bytes)}
+        response = requests.post(url, data=payload, files=files, timeout=20)
+        res_data = response.json()
+        if res_data.get("success"):
+            return res_data["data"]["url"]
+        return None
+    except Exception as e:
+        print(f"Imgbb Error: {e}")
+        return None
+
+# ==================== [ 🤖 ADMIN TELEGRAM BOT LOGIC ] ====================
+
+def handle_bot_updates():
+    offset = 0
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    
+    print("🤖 Admin Telegram Bot is running...")
+    
+    while True:
+        try:
+            response = requests.get(url, params={"offset": offset, "timeout": 30})
+            updates = response.json().get("result", [])
+            
+            for update in updates:
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                chat_id = str(message.get("chat", {}).get("id"))
+                text = message.get("text", "")
+                
+                # ဆိုင်ရှင်ဖြစ်ကြောင်း စစ်ဆေးခြင်း
+                if chat_id != TELEGRAM_CHAT_ID:
+                    continue
+                
+                if text == "/start" or text == "/help":
+                    help_text = (
+                        "🏪 *CAPA CAFE - Admin Control Bot*\n\n"
+                        "💡 *အသုံးပြုနိုင်သော Commands များ:*\n"
+                        "• `/list` - ပစ္စည်းစာရင်းအားလုံး ကြည့်ရန်\n"
+                        "• `/add နာမည်,ဈေးနှုန်း` - ပစ္စည်းအသစ်တင်ရန် (ဓာတ်ပုံကို Caption တွင် ဤစာသားထည့်၍ ပို့ပါ)\n"
+                        "• `/delete ပစ္စည်းနံပါတ်` - ပစ္စည်းကို ဖျက်ရန်\n\n"
+                        "ℹ️ _ဥပမာ- ပုံတစ်ပုံကို ရွေးပြီး Caption တွင် `/add Latte,3500` ဟု ရေး၍ ပို့ပေးပါ။_"
+                    )
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": help_text, "parse_mode": "Markdown"})
+                
+                elif text == "/list":
+                    products = load_products()
+                    if not products:
+                        msg = "❌ ဆိုင်မှာ ပစ္စည်းစာရင်း မရှိသေးပါဗျာ။"
+                    else:
+                        msg = "📋 *လက်ရှိ ပစ္စည်းစာရင်းများ:*\n━━━━━━━━━━━━━━━\n"
+                        for idx, p in enumerate(products):
+                            msg += f"{idx + 1}. *{p['name']}* - {p['price']:,} MMK\nID: `{p['id']}`\n\n"
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+                
+                elif text.startswith("/delete"):
+                    try:
+                        idx_to_del = int(text.split(" ")[1]) - 1
+                        products = load_products()
+                        if 0 <= idx_to_del < len(products):
+                            removed = products.pop(idx_to_del)
+                            save_products(products)
+                            msg = f"✅ *{removed['name']}* ကို စနစ်ထဲမှ ဖျက်လိုက်ပါပြီ။"
+                        else:
+                            msg = "❌ ပစ္စည်းနံပါတ် မှားယွင်းနေပါသည်။ `/list` တွင် ပြန်စစ်ပါ။"
+                    except Exception:
+                        msg = "❌ ပုံစံမမှန်ပါ။ ဥပမာ- `/delete 1` ဟု သုံးပါ။"
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+                
+                # ဓာတ်ပုံနှင့်အတူ ပစ္စည်းအသစ်ဝင်လာခြင်းကို လက်ခံခြင်း
+                elif "photo" in message and message.get("caption", "").startswith("/add"):
+                    caption = message.get("caption", "")
+                    try:
+                        # Parsing "/add Latte,3500"
+                        data_part = caption.replace("/add ", "").split(",")
+                        p_name = data_part[0].strip()
+                        p_price = int(data_part[1].strip())
+                        
+                        # Telegram Server ပေါ်ကပုံကို လှမ်းယူခြင်း
+                        photo_file_id = message["photo"][-1]["file_id"]
+                        file_info = requests.get(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getFile", params={"file_id": photo_file_id}).json()
+                        file_path = file_info["result"]["file_path"]
+                        file_bytes = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}").content
+                        
+                        # Imgbb ပေါ်သို့ လွှဲတင်ခြင်း
+                        img_url = upload_to_imgbb(file_bytes, f"{p_name}.jpg")
+                        
+                        if img_url:
+                            products = load_products()
+                            new_product = {
+                                "id": str(int(time.time())),
+                                "name": p_name,
+                                "price": p_price,
+                                "image": img_url
+                            }
+                            products.append(new_product)
+                            save_products(products)
+                            msg = f"📊 *သိမ်းဆည်းမှု အောင်မြင်ပါသည်!*\n• ပစ္စည်း: {p_name}\n• ဈေးနှုန်း: {p_price:,} MMK"
+                        else:
+                            msg = "❌ ပုံကို Server ပေါ်တင်ရတာ မအောင်မြင်ပါ။"
+                    except Exception as e:
+                        msg = f"❌ ပုံစံမမှန်ပါ။ ဥပမာ- `/add Coffee Name,3000` ဟု ရေးပါ။ ({e})"
+                    requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json={"chat_id": chat_id, "text": msg, "parse_mode": "Markdown"})
+                    
+        except Exception as e:
+            print(f"Bot Loop Error: {e}")
+        time.sleep(1)
+
+# Bot အား Web Backend နှင့်အတူ ပြိုင်တည်းအလုပ်လုပ်ရန် Thread ခွဲမောင်းခြင်း
+Thread(target=handle_bot_updates, daemon=True).start()
+
+# ==================== [ 🌐 USER WEB API LOGIC ] ====================
+
+@app.route('/api/products', methods=['GET'])
+def get_products():
+    """ Web Frontend က လာဖတ်ရင် လက်ရှိပစ္စည်းစာရင်းတွေ အကုန် Live ထုတ်ပေးမည့် API """
+    return jsonify(load_products()), 200
+
+@app.route('/api/order', methods=['POST'])
+def handle_order():
+    name = request.form.get('customer_name')
+    phone = request.form.get('customer_phone')
+    address = request.form.get('customer_address')
+    items = json.loads(request.form.get('items', '[]'))
+    screenshot_file = request.files.get('screenshot')
+
+    if not name or not phone or not address or not screenshot_file:
+        return jsonify({"success": False, "message": "Missing fields"}), 400
+
+    # Screenshot ပုံတင်ခြင်း
+    uploaded_img_url = upload_to_imgbb(screenshot_file.stream.read(), screenshot_file.filename)
+    if not uploaded_img_url:
+        return jsonify({"success": False, "message": "Image upload failed"}), 500
+
+    items_text = ""
+    grand_total = 0
+    for item in items:
+        item_total = int(item['price']) * int(item['qty'])
+        grand_total += item_total
+        items_text += f"• <b>{item['name']}</b> ({int(item['price']):,} x {item['qty']}) = {item_total:,} MMK\n"
+
+    telegram_message = (
+        "☕️ <b>CAPA CAFE - အော်ဒါအသစ် ရောက်ရှိပါပြီ။</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👤 <b>ဝယ်ယူသူအမည်:</b> {name}\n"
+        f"📞 <b>ဖုန်းနံပါတ်:</b> {phone}\n"
+        f"📍 <b>ပို့ဆောင်ရမည့်လိပ်စာ:</b> {address}\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🛍️ <b>မှာယူသည့်ပစ္စည်းများ-</b>\n"
+        f"{items_text}"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💰 <b>စုစုပေါင်း ကျသင့်ငွေ:</b> <code>{grand_total:,} MMK</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "👉 <i>ငွေလွှဲပြေစာအား စစ်ဆေးပြီး အော်ဒါအား အတည်ပြုပေးပါ။</i>"
+    )
+
+    # Order ပုံနှင့်စာတွဲပို့ခြင်း
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    res = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "photo": uploaded_img_url, "caption": telegram_message, "parse_mode": "HTML"})
+
+    if res.json().get("ok"):
+        return jsonify({"success": True}), 200
+    return jsonify({"success": False}), 500
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000, debug=False)
